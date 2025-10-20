@@ -4,23 +4,25 @@ import logging
 import uuid
 import sys
 from datetime import datetime
+import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from db import (
     init_db, create_user, get_user_by_tgid, get_user_by_account,
     transfer_funds, create_transaction, add_register_code,
-    get_account_balance, adjust_account_balance, # new helpers for ACC-001
+    get_account_balance, adjust_account_balance,
     add_admin, remove_admin, list_admins,
     can_use_account, create_business_account, transfer_account_ownership,
-    list_all_users, list_user_accounts, is_admin, is_bank_owner
+    list_all_users, list_user_accounts, is_admin, is_bank_owner,
+    delete_account, delete_business_account
 )
 from receipt import generate_receipt_image
 
-# ---------------- Config (from ENV) ----------------
-BOT_TOKEN = os.environ["BOT_TOKEN"] # REQUIRED
-BANK_GROUP_ID = int(os.environ.get("BANK_GROUP_ID", "0")) # REQUIRED in production (group/channel id)
-BANK_OWNER_ID = int(os.environ.get("BANK_OWNER_ID", "0")) # REQUIRED (only this person can manage admins)
+# ---------------- Config ----------------
+BOT_TOKEN = "8021975466:AAGV_CanoaR3FQ-7c3WcPXbZRPpK6_K-KMQ"  # unchanged
+BANK_GROUP_ID = int(os.environ.get("BANK_GROUP_ID", "-1002585326279"))
+BANK_OWNER_ID = int(os.environ.get("BANK_OWNER_ID", "8423995337"))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bankbot")
@@ -37,43 +39,63 @@ HELP_TEXT = (
     "/start — Show welcome\n"
     "/help — Show this help\n"
     "/register <code> — Open a personal account using a registration code\n"
-    "/balance — Show your main (personal) account balance\n"
-    "/myaccounts — List all accounts you can use\n"
-    "/transfer <to_account_id> <amount> — Transfer Solen to another account\n\n"
+    "/balance — Show your main account balance\n"
+    "/myaccounts — List your accounts\n"
+    "/transfer <to_account_id> <amount> — Transfer money\n\n"
     "— Business Owners —\n"
-    "/paysalary <from_business_acc> <to_account_id> <amount> — Pay salary from your business account\n\n"
+    "/paysalary <from_business_acc> <to_acc> <amount>\n\n"
     "— Bank Admins —\n"
-    "/newcode <code> — Create a registration code\n"
-    "/createbusiness <name> — Create a business account for the current user\n"
-    "/transferowner <account_id> <new_owner_tg_id> — Transfer business ownership\n"
-    "/bankadd <amount> — Add funds to ACC-001 (bank)\n"
-    "/banktake <amount> — Take funds from ACC-001 (bank)\n"
-    "/listusers — List registered users\n\n"
+    "/newcode <code> — Add registration code\n"
+    "/createbusiness <name> — Create business account\n"
+    "/transferowner <account_id> <new_owner_tg_id>\n"
+    "/listusers — List all users\n"
+    "/bankadd <amount> — Add to main bank\n"
+    "/banktake <amount> — Take from main bank\n"
+    "/bankbalance — Show main bank balance\n"
+    "/banktransfer <to_account_id> <amount>\n"
+    "/takefrom <from_account_id> <amount> — Withdraw from any account\n"
+    "/closeaccount <account_id> — Delete account\n"
+    "/closebusiness <account_id> — Delete business account\n\n"
     "— Bank Owner —\n"
-    "/addadmin <telegram_id> <name> — Add admin\n"
-    "/removeadmin <telegram_id> — Remove admin\n"
-    "/listadmins — List admins\n"
+    "/addadmin <telegram_id> <name>\n"
+    "/removeadmin <telegram_id>\n"
+    "/listadmins\n"
 )
 
 # ---------------- Helpers ----------------
 async def _send_receipt(context: ContextTypes.DEFAULT_TYPE, receipt_path: str, sender_tg_id: int, receiver_tg_id: int | None):
-    # send to sender
     try:
-        await context.bot.send_photo(chat_id=sender_tg_id, photo=open(receipt_path, "rb"))
+        with open(receipt_path, "rb") as f:
+            await context.bot.send_photo(chat_id=sender_tg_id, photo=f)
     except Exception as e:
         logger.warning(f"Failed sending receipt to sender: {e}")
-    # send to receiver
     if receiver_tg_id:
         try:
-            await context.bot.send_photo(chat_id=receiver_tg_id, photo=open(receipt_path, "rb"))
+            with open(receipt_path, "rb") as f:
+                await context.bot.send_photo(chat_id=receiver_tg_id, photo=f)
         except Exception as e:
             logger.warning(f"Failed sending receipt to receiver: {e}")
-    # send to bank group
     if BANK_GROUP_ID:
         try:
-            await context.bot.send_photo(chat_id=BANK_GROUP_ID, photo=open(receipt_path, "rb"))
+            with open(receipt_path, "rb") as f:
+                await context.bot.send_photo(chat_id=BANK_GROUP_ID, photo=f)
         except Exception as e:
-            logger.warning(f"Failed sending receipt to bank group: {e}")
+            logger.warning(f"Failed sending receipt to group: {e}")
+
+def _parse_amount(s: str) -> float | None:
+    try:
+        v = float(s)
+        return v if v > 0 else None
+    except:
+        return None
+
+async def _reply_split(update: Update, text: str, chunk: int = 3900):
+    while text:
+        await update.message.reply_text(text[:chunk])
+        text = text[chunk:]
+
+async def _is_admin_or_owner(tg_id: int) -> bool:
+    return (await is_admin(tg_id)) or (await is_bank_owner(tg_id, BANK_OWNER_ID))
 
 # ---------------- User Commands ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -90,285 +112,267 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = context.args[0].strip()
     account_id, msg = await create_user(user.id, user.username or "", user.full_name or "", code)
     if not account_id:
-        await update.message.reply_text(f"❌ Error: {msg}")
+        await update.message.reply_text(f"❌ {msg}")
         return
-
-    # notify user
     await update.message.reply_text(f"✅ Account created!\nAccount ID: {account_id}\nBalance: 0 Solen")
-
-    # notify bank group
     if BANK_GROUP_ID:
-        try:
-            await context.bot.send_message(
-                chat_id=BANK_GROUP_ID,
-                text=f"🟢 New user registered: {user.full_name} (@{user.username or 'no-username'}) — TGID: {user.id}\n"
-                     f"Personal Account: {account_id}"
-            )
-        except Exception as e:
-            logger.warning(f"Failed to notify bank group on registration: {e}")
+        await context.bot.send_message(
+            chat_id=BANK_GROUP_ID,
+            text=f"🟢 New user: {user.full_name} (@{user.username or 'no-username'}) — TGID: {user.id}\nAccount: {account_id}"
+        )
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = await get_user_by_tgid(update.effective_user.id)
     if not user:
-        await update.message.reply_text("⛔ You don’t have an account. Use /register <code> first.")
+        await update.message.reply_text("⛔ No account found.")
         return
-    # default: show the first account in their list (personal) or explicit personal type
     accounts = await list_user_accounts(update.effective_user.id)
     if not accounts:
-        await update.message.reply_text("⛔ No accounts found. Use /register <code> first.")
+        await update.message.reply_text("⛔ No accounts found.")
         return
-    # Prefer PERSONAL if exists
     main_acc = next((a for a in accounts if a["type"] == "PERSONAL"), accounts[0])
-    bal = main_acc["balance"]
-    await update.message.reply_text(f"📊 Account: {main_acc['account_id']}\nBalance: {bal} Solen")
+    await update.message.reply_text(f"📊 {main_acc['account_id']}: {main_acc['balance']} Solen")
 
 async def myaccounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     accounts = await list_user_accounts(update.effective_user.id)
     if not accounts:
-        await update.message.reply_text("You have no accounts yet.")
+        await update.message.reply_text("You have no accounts.")
         return
-    lines = []
-    for a in accounts:
-        lines.append(f"- {a['account_id']} | {a['type']}{' — ' + a['name'] if a['name'] else ''} | Balance: {a['balance']}")
-    await update.message.reply_text("👛 Your accounts:\n" + "\n".join(lines))
+    text = "\n".join([f"- {a['account_id']} | {a['type']} | Balance: {a['balance']}" for a in accounts])
+    await update.message.reply_text("👛 Accounts:\n" + text)
 
 async def transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sender = await get_user_by_tgid(update.effective_user.id)
-    if not sender:
-        await update.message.reply_text("⛔ You don’t have an account. Use /register <code> first.")
-        return
-
     if len(context.args) < 2:
         await update.message.reply_text("Usage: /transfer <to_account_id> <amount>")
         return
-
-    to_account = context.args[0].strip().upper()
-    try:
-        amount = float(context.args[1])
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("❌ Amount must be a positive number.")
+    if not await get_user_by_tgid(update.effective_user.id):
+        await update.message.reply_text("⛔ You don’t have an account.")
         return
-
-    # Choose default from_account = first account user can use (prefer PERSONAL)
+    to_acc = context.args[0].strip().upper()
+    amount = _parse_amount(context.args[1])
+    if amount is None:
+        await update.message.reply_text("❌ Invalid amount. Must be > 0.")
+        return
     accounts = await list_user_accounts(update.effective_user.id)
     if not accounts:
-        await update.message.reply_text("⛔ You don’t have any usable account.")
+        await update.message.reply_text("⛔ No accounts found.")
         return
-    from_account = next((a["account_id"] for a in accounts if a["type"] == "PERSONAL"), accounts[0]["account_id"])
-
-    # Permission check
-    allowed = await can_use_account(update.effective_user.id, from_account)
-    if not allowed:
-        await update.message.reply_text("⛔ You are not allowed to use this account.")
-        return
-
-    txid = "TX-" + uuid.uuid4().hex[:8].upper()
-    success, status = await transfer_funds(from_account, to_account, amount)
-    receiver = await get_user_by_account(to_account)
-
-    await create_transaction(
-        txid, from_account, to_account, amount,
-        "Completed" if success else "Incomplete"
-    )
-
-    # generate receipt with live timestamp
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    receipt_path = generate_receipt_image(
-        txid, now_str, from_account, to_account, amount,
-        "Completed" if success else "Incomplete"
-    )
-
-    # send receipts
-    receiver_tg = receiver["tg_id"] if receiver else None
-    await _send_receipt(context, receipt_path, update.effective_user.id, receiver_tg)
-
-    if success:
-        await update.message.reply_text("✅ Transfer successful.")
-    else:
-        await update.message.reply_text(f"❌ Transfer failed. {status}")
-
-# ---------------- Business Owner Commands ----------------
-async def paysalary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 3:
-        await update.message.reply_text("Usage: /paysalary <from_business_acc> <to_account_id> <amount>")
-        return
-    from_acc = context.args[0].strip().upper()
-    to_acc = context.args[1].strip().upper()
-    try:
-        amount = float(context.args[2])
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("❌ Amount must be a positive number.")
-        return
-
-    # must be business account and owned/accessible by user
-    if not await can_use_account(update.effective_user.id, from_acc, must_be_type="BUSINESS"):
-        await update.message.reply_text("⛔ You are not allowed to use this business account.")
-        return
-
+    from_acc = next((a["account_id"] for a in accounts if a["type"] == "PERSONAL"), accounts[0]["account_id"])
     txid = "TX-" + uuid.uuid4().hex[:8].upper()
     success, status = await transfer_funds(from_acc, to_acc, amount)
     receiver = await get_user_by_account(to_acc)
-    await create_transaction(
-        txid, from_acc, to_acc, amount,
-        "Completed" if success else "Incomplete"
-    )
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    receipt_path = generate_receipt_image(
-        txid, now_str, from_acc, to_acc, amount,
-        "Completed" if success else "Incomplete"
-    )
+    await create_transaction(txid, from_acc, to_acc, amount, "Completed" if success else "Failed")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    receipt = generate_receipt_image(txid, now, from_acc, to_acc, amount, "Completed" if success else "Failed")
     receiver_tg = receiver["tg_id"] if receiver else None
-    await _send_receipt(context, receipt_path, update.effective_user.id, receiver_tg)
-    await update.message.reply_text("✅ Salary paid." if success else f"❌ Error: {status}")
+    await _send_receipt(context, receipt, update.effective_user.id, receiver_tg)
+    await update.message.reply_text("✅ Done!" if success else f"❌ {status}")
 
-# ---------------- Bank Admin Commands ----------------
+# ---------------- Business ----------------
+async def paysalary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 3:
+        await update.message.reply_text("Usage: /paysalary <from_business_acc> <to_acc> <amount>")
+        return
+    from_acc, to_acc = context.args[0].upper(), context.args[1].upper()
+    amount = _parse_amount(context.args[2])
+    if amount is None:
+        await update.message.reply_text("❌ Invalid amount. Must be > 0.")
+        return
+    if not await can_use_account(update.effective_user.id, from_acc, must_be_type="BUSINESS"):
+        await update.message.reply_text("⛔ Not your business account.")
+        return
+    txid = "TX-" + uuid.uuid4().hex[:8].upper()
+    success, status = await transfer_funds(from_acc, to_acc, amount)
+    receiver = await get_user_by_account(to_acc)
+    await create_transaction(txid, from_acc, to_acc, amount, "Completed" if success else "Failed")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    receipt = generate_receipt_image(txid, now, from_acc, to_acc, amount, "Completed" if success else "Failed")
+    receiver_tg = receiver["tg_id"] if receiver else None
+    await _send_receipt(context, receipt, update.effective_user.id, receiver_tg)
+    await update.message.reply_text("✅ Salary paid." if success else f"❌ {status}")
+
+# ---------------- Admin ----------------
 async def newcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Only bank admins can use this command.")
-        return
+    if not await _is_admin_or_owner(update.effective_user.id):
+        return await update.message.reply_text("⛔ Admins only.")
     if not context.args:
-        await update.message.reply_text("Usage: /newcode <code>")
-        return
-    code = context.args[0].strip()
-    ok, msg = await add_register_code(code)
-    await update.message.reply_text("✅ New register code added." if ok else f"❌ {msg}")
+        return await update.message.reply_text("Usage: /newcode <code>")
+    ok, msg = await add_register_code(context.args[0].strip())
+    await update.message.reply_text("✅ Code added." if ok else f"❌ {msg}")
 
-async def bank_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Only bank admins can use this command.")
-        return
-    if len(context.args) < 1:
-        await update.message.reply_text("Usage: /bankadd <amount>")
-        return
-    try:
-        amount = float(context.args[0])
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("❌ Amount must be positive.")
-        return
-    ok, msg = await adjust_account_balance("ACC-001", amount)
-    await update.message.reply_text("✅ Added to bank balance." if ok else f"❌ {msg}")
-
-async def bank_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Only bank admins can use this command.")
-        return
-    if len(context.args) < 1:
-        await update.message.reply_text("Usage: /banktake <amount>")
-        return
-    try:
-        amount = float(context.args[0])
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("❌ Amount must be positive.")
-        return
-    ok, msg = await adjust_account_balance("ACC-001", -amount)
-    await update.message.reply_text("✅ Taken from bank balance." if ok else f"❌ {msg}")
-
-async def create_business(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Only bank admins can create business accounts.")
-        return
-    if len(context.args) < 1:
-        await update.message.reply_text("Usage: /createbusiness <name>")
-        return
+async def createbusiness(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _is_admin_or_owner(update.effective_user.id):
+        return await update.message.reply_text("⛔ Admins only.")
+    if not context.args:
+        return await update.message.reply_text("Usage: /createbusiness <name>")
     name = " ".join(context.args).strip()
-    acc_id, msg = await create_business_account(update.effective_user.id, update.effective_chat.id, name)
-    if acc_id:
-        await update.message.reply_text(f"✅ Business account created: {name}\nAccount ID: {acc_id}")
-    else:
-        await update.message.reply_text(f"❌ {msg}")
+    acc_id, err = await create_business_account(update.effective_user.id, name)
+    if err:
+        return await update.message.reply_text(f"❌ {err}")
+    await update.message.reply_text(f"✅ Business account created: {acc_id} (owner: {update.effective_user.full_name})")
 
-async def transfer_owner(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Only bank admins can transfer ownership.")
-        return
+async def transferowner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _is_admin_or_owner(update.effective_user.id):
+        return await update.message.reply_text("⛔ Admins only.")
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /transferowner <account_id> <new_owner_tg_id>")
-        return
-    acc = context.args[0].strip().upper()
+        return await update.message.reply_text("Usage: /transferowner <account_id> <new_owner_tg_id>")
+    acc_id = context.args[0].upper()
     try:
         new_owner = int(context.args[1])
     except ValueError:
-        await update.message.reply_text("❌ new_owner_tg_id must be a number.")
-        return
-    ok, msg = await transfer_account_ownership(acc, new_owner)
-    await update.message.reply_text(f"✅ Ownership of {acc} transferred to {new_owner}" if ok else f"❌ {msg}")
+        return await update.message.reply_text("❌ new_owner_tg_id must be a number.")
+    user = await get_user_by_tgid(new_owner)
+    if not user:
+        return await update.message.reply_text("❌ New owner has no user record. Ask them to /register first.")
+    ok, msg = await transfer_account_ownership(acc_id, new_owner)
+    await update.message.reply_text("✅ Ownership transferred." if ok else f"❌ {msg}")
 
-async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Only bank admins can use this command.")
-        return
+async def listusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _is_admin_or_owner(update.effective_user.id):
+        return await update.message.reply_text("⛔ Admins only.")
     users = await list_all_users()
     if not users:
-        await update.message.reply_text("No users yet.")
-        return
-    lines = [f"- {u['full_name']} (@{u['username'] or 'no-username'}) — TGID: {u['tg_id']} — Account: {u['account_id']}" for u in users]
-    await update.message.reply_text("👥 Users:\n" + "\n".join(lines))
+        return await update.message.reply_text("No users found.")
+    lines = [f"- {u['full_name']} (@{u['username'] or '—'}) | TGID: {u['tg_id']} | ACC: {u['account_id']}" for u in users]
+    await _reply_split(update, "👥 Users (" + str(len(users)) + "):\n" + "\n".join(lines))
 
-# ---------------- Bank Owner Commands ----------------
+async def bank_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _is_admin_or_owner(update.effective_user.id):
+        return await update.message.reply_text("⛔ Admins only.")
+    if not context.args:
+        return await update.message.reply_text("Usage: /bankadd <amount>")
+    amount = _parse_amount(context.args[0])
+    if amount is None:
+        return await update.message.reply_text("❌ Invalid amount. Must be > 0.")
+    ok, msg = await adjust_account_balance("ACC-001", amount)
+    await update.message.reply_text("✅ Added." if ok else f"❌ {msg}")
+
+async def bank_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _is_admin_or_owner(update.effective_user.id):
+        return await update.message.reply_text("⛔ Admins only.")
+    if not context.args:
+        return await update.message.reply_text("Usage: /banktake <amount>")
+    amount = _parse_amount(context.args[0])
+    if amount is None:
+        return await update.message.reply_text("❌ Invalid amount. Must be > 0.")
+    ok, msg = await adjust_account_balance("ACC-001", -amount)
+    await update.message.reply_text("✅ Taken." if ok else f"❌ {msg}")
+
+async def bank_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _is_admin_or_owner(update.effective_user.id):
+        return await update.message.reply_text("⛔ Admins only.")
+    bal = await get_account_balance("ACC-001")
+    await update.message.reply_text(f"🏦 Bank balance: {bal} Solen")
+
+async def bank_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _is_admin_or_owner(update.effective_user.id):
+        return await update.message.reply_text("⛔ Admins only.")
+    if len(context.args) < 2:
+        return await update.message.reply_text("Usage: /banktransfer <to_acc> <amount>")
+    to_acc = context.args[0].upper()
+    amount = _parse_amount(context.args[1])
+    if amount is None:
+        return await update.message.reply_text("❌ Invalid amount. Must be > 0.")
+    txid = "TX-" + uuid.uuid4().hex[:8].upper()
+    success, status = await transfer_funds("ACC-001", to_acc, amount)
+    receiver = await get_user_by_account(to_acc)
+    await create_transaction(txid, "ACC-001", to_acc, amount, "Completed" if success else "Failed")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    receipt = generate_receipt_image(txid, now, "ACC-001", to_acc, amount, "Completed" if success else "Failed")
+    receiver_tg = receiver["tg_id"] if receiver else None
+    await _send_receipt(context, receipt, update.effective_user.id, receiver_tg)
+    await update.message.reply_text("✅ Transfer done." if success else f"❌ {status}")
+
+async def take_from(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _is_admin_or_owner(update.effective_user.id):
+        return await update.message.reply_text("⛔ Admins only.")
+    if len(context.args) < 2:
+        return await update.message.reply_text("Usage: /takefrom <from_acc> <amount>")
+    from_acc = context.args[0].upper()
+    amount = _parse_amount(context.args[1])
+    if amount is None:
+        return await update.message.reply_text("❌ Invalid amount. Must be > 0.")
+    txid = "TX-" + uuid.uuid4().hex[:8].upper()
+    success, status = await transfer_funds(from_acc, "ACC-001", amount)
+    await create_transaction(txid, from_acc, "ACC-001", amount, "Completed" if success else "Failed")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    receipt = generate_receipt_image(txid, now, from_acc, "ACC-001", amount, "Completed" if success else "Failed")
+    sender = await get_user_by_account(from_acc)
+    sender_tg = sender["tg_id"] if sender else None
+    await _send_receipt(context, receipt, update.effective_user.id, sender_tg)
+    await update.message.reply_text("✅ Taken." if success else f"❌ {status}")
+
+async def close_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _is_admin_or_owner(update.effective_user.id):
+        return await update.message.reply_text("⛔ Admins only.")
+    if not context.args:
+        return await update.message.reply_text("Usage: /closeaccount <account_id>")
+    ok, msg = await delete_account(context.args[0].upper())
+    await update.message.reply_text(f"✅ Deleted." if ok else f"❌ {msg}")
+
+async def close_business(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _is_admin_or_owner(update.effective_user.id):
+        return await update.message.reply_text("⛔ Admins only.")
+    if not context.args:
+        return await update.message.reply_text("Usage: /closebusiness <account_id>")
+    ok, msg = await delete_business_account(context.args[0].upper())
+    await update.message.reply_text(f"✅ Business deleted." if ok else f"❌ {msg}")
+
+# ---------------- Owner ----------------
 async def add_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_bank_owner(update.effective_user.id, BANK_OWNER_ID):
-        await update.message.reply_text("⛔ Only the bank owner can add admins.")
-        return
+        return await update.message.reply_text("⛔ Owner only.")
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /addadmin <telegram_id> <name>")
-        return
+        return await update.message.reply_text("Usage: /addadmin <id> <name>")
     try:
         tg_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("❌ telegram_id must be a number.")
-        return
-    name = context.args[1]
+        return await update.message.reply_text("❌ <id> must be a number.")
+    name = " ".join(context.args[1:]).strip()
+    if not name:
+        return await update.message.reply_text("❌ Name cannot be empty.")
     await add_admin(tg_id, name)
     await update.message.reply_text(f"✅ Admin added: {name} ({tg_id})")
 
 async def remove_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_bank_owner(update.effective_user.id, BANK_OWNER_ID):
-        await update.message.reply_text("⛔ Only the bank owner can remove admins.")
-        return
-    if len(context.args) < 1:
-        await update.message.reply_text("Usage: /removeadmin <telegram_id>")
-        return
+        return await update.message.reply_text("⛔ Owner only.")
+    if not context.args:
+        return await update.message.reply_text("Usage: /removeadmin <telegram_id>")
     try:
         tg_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("❌ telegram_id must be a number.")
-        return
+        return await update.message.reply_text("❌ <telegram_id> must be a number.")
     await remove_admin(tg_id)
-    await update.message.reply_text(f"✅ Admin with ID {tg_id} removed.")
+    await update.message.reply_text(f"✅ Removed admin {tg_id}")
 
 async def list_admins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_bank_owner(update.effective_user.id, BANK_OWNER_ID):
-        await update.message.reply_text("⛔ Only the bank owner can view the admin list.")
-        return
+        return await update.message.reply_text("⛔ Owner only.")
     admins = await list_admins()
     if not admins:
-        await update.message.reply_text("No admins yet.")
-    else:
-        text = "👑 Admins:\n" + "\n".join([f"- {name} ({tid})" for tid, name in admins])
-        await update.message.reply_text(text)
+        return await update.message.reply_text("No admins.")
+    text = "\n".join([f"- {name} ({tg_id})" for tg_id, name in admins])
+    await update.message.reply_text("👑 Admins:\n" + text)
 
-# ---------------- Main ----------------
+# ---------------- PTB post-init: run DB init inside PTB's own loop ----------------
+async def _post_init(app: Application):
+    await init_db(BANK_OWNER_ID)
+
+# ---------------- Main (no asyncio.run; no manual loops) ----------------
 if __name__ == "__main__":
-    # Fix for Windows event loop
     if sys.platform == "win32":
-        import asyncio
+        # Ensure PTB creates a selector-based loop on Windows
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    # Init DB
-    import asyncio
-    asyncio.get_event_loop().run_until_complete(init_db(BANK_OWNER_ID))
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(_post_init)  # run init_db inside PTB-managed loop
+        .build()
+    )
 
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    # Everyone
+    # User
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("register", register))
@@ -376,21 +380,26 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("myaccounts", myaccounts))
     app.add_handler(CommandHandler("transfer", transfer))
 
-    # Business owners
+    # Business
     app.add_handler(CommandHandler("paysalary", paysalary))
 
-    # Bank admins
+    # Admin
     app.add_handler(CommandHandler("newcode", newcode))
+    app.add_handler(CommandHandler("createbusiness", createbusiness))
+    app.add_handler(CommandHandler("transferowner", transferowner))
+    app.add_handler(CommandHandler("listusers", listusers))
     app.add_handler(CommandHandler("bankadd", bank_add))
     app.add_handler(CommandHandler("banktake", bank_take))
-    app.add_handler(CommandHandler("createbusiness", create_business))
-    app.add_handler(CommandHandler("transferowner", transfer_owner))
-    app.add_handler(CommandHandler("listusers", list_users))
+    app.add_handler(CommandHandler("bankbalance", bank_balance))
+    app.add_handler(CommandHandler("banktransfer", bank_transfer))
+    app.add_handler(CommandHandler("takefrom", take_from))
+    app.add_handler(CommandHandler("closeaccount", close_account))
+    app.add_handler(CommandHandler("closebusiness", close_business))
 
-    # Bank owner
+    # Owner
     app.add_handler(CommandHandler("addadmin", add_admin_cmd))
     app.add_handler(CommandHandler("removeadmin", remove_admin_cmd))
     app.add_handler(CommandHandler("listadmins", list_admins_cmd))
 
-    print("🤖 Bot is running...")
-    app.run_polling()
+    # Single synchronous call; PTB manages its own loop safely
+    app.run_polling(drop_pending_updates=True)

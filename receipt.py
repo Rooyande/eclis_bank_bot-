@@ -3,14 +3,14 @@ from PIL import Image, ImageDraw, ImageFont
 import os
 from datetime import datetime
 
-LOGO_PATH = "assets/logo.png" # optional path to your logo
+LOGO_PATH = "assets/logo.png"  # optional path to your logo
 OUT_DIR = "receipts"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 def get_font(size=22):
     try:
         return ImageFont.truetype("DejaVuSans.ttf", size)
-    except:
+    except Exception:
         return ImageFont.load_default()
 
 def generate_receipt_image(txid, date, from_account, to_account, amount, status):
@@ -19,9 +19,9 @@ def generate_receipt_image(txid, date, from_account, to_account, amount, status)
         date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     W, H = 800, 1000
-    bg_color = (0, 0, 0) # black background
-    gold = (201, 161, 81) # gold color
-    white = (240, 240, 240) # white text
+    bg_color = (0, 0, 0)         # black background
+    gold = (201, 161, 81)        # gold color
+    white = (240, 240, 240)      # white text
 
     # create background
     im = Image.new("RGB", (W, H), color=bg_color)
@@ -31,16 +31,16 @@ def generate_receipt_image(txid, date, from_account, to_account, amount, status)
     if os.path.exists(LOGO_PATH):
         try:
             logo = Image.open(LOGO_PATH).convert("RGBA")
-            logo.thumbnail((int(W * 0.4), int(W * 0.4))) # scale logo
+            logo.thumbnail((int(W * 0.4), int(W * 0.4)))  # scale logo
             lx = (W - logo.width) // 2
             im.paste(logo, (lx, 40), logo)
-        except:
+        except Exception:
             pass
 
-    # bank name
+    # bank name (unified)
     f_big = get_font(40)
-    text = "ECLIS BANK"
-    bbox = draw.textbbox((0, 0), text, font=f_big) # bounding box
+    text = "SOLEN BANK"
+    bbox = draw.textbbox((0, 0), text, font=f_big)  # bounding box
     w = bbox[2] - bbox[0]
     draw.text(((W - w) / 2, 300), text, font=f_big, fill=gold)
 

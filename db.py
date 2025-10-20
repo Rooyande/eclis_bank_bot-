@@ -1,307 +1,279 @@
 # db.py
-import os, aiosqlite, string, random
-from typing import Tuple, Dict, Any, List
+import os
+import random
+import string
+import aiosqlite
 
 DB_PATH = os.environ.get("DB_PATH", "bank.db")
 
-def _gen_account_id() -> str:
-    # e.g., ACC-AB12CD
-    alphabet = string.ascii_uppercase + string.digits
-    return "ACC-" + "".join(random.choice(alphabet) for _ in range(6))
+# -------------------- Helpers --------------------
+async def _generate_unique_account_id(db: aiosqlite.Connection, prefix: str, digits: int, reserved: set[str] | None = None) -> str:
+    reserved = reserved or set()
+    while True:
+        suffix = "".join(random.choices(string.digits, k=digits))
+        acc_id = f"{prefix}{suffix}"
+        if acc_id in reserved:
+            continue
+        cur = await db.execute("SELECT 1 FROM accounts WHERE account_id = ?", (acc_id,))
+        if not await cur.fetchone():
+            return acc_id
 
-async def init_db(bank_owner_id: int):
+# -------------------- INIT --------------------
+async def init_db(owner_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.executescript("""
-        PRAGMA journal_mode=WAL;
-
-        CREATE TABLE IF NOT EXISTS users (
-            tg_id INTEGER PRIMARY KEY,
-            username TEXT,
-            full_name TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS accounts (
-            account_id TEXT PRIMARY KEY,
-            owner_tg_id INTEGER,
-            balance REAL DEFAULT 0,
-            type TEXT CHECK(type IN ('PERSONAL','BUSINESS','BANK')) NOT NULL,
-            name TEXT,
-            FOREIGN KEY(owner_tg_id) REFERENCES users(tg_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS account_access (
-            tg_id INTEGER,
-            account_id TEXT,
-            PRIMARY KEY (tg_id, account_id),
-            FOREIGN KEY(tg_id) REFERENCES users(tg_id),
-            FOREIGN KEY(account_id) REFERENCES accounts(account_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS transactions (
-            txid TEXT PRIMARY KEY,
-            from_account TEXT,
-            to_account TEXT,
-            amount REAL,
-            status TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS register_codes (
-            code TEXT PRIMARY KEY,
-            used INTEGER DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS admins (
-            tg_id INTEGER PRIMARY KEY,
-            name TEXT
-        );
-        """)
-        # Ensure bank owner exists in users
-        await db.execute(
-            "INSERT OR IGNORE INTO users (tg_id, username, full_name) VALUES (?, ?, ?)",
-            (bank_owner_id, None, "BANK_OWNER")
-        )
-
-        # Ensure ACC-001 exists as BANK account
         await db.execute("""
-            INSERT OR IGNORE INTO accounts (account_id, owner_tg_id, balance, type, name)
-            VALUES ('ACC-001', ?, 0, 'BANK', 'Central Bank')
-        """, (bank_owner_id,))
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tg_id INTEGER UNIQUE,
+            username TEXT,
+            full_name TEXT,
+            personal_account TEXT
+        )
+        """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id TEXT UNIQUE,
+            owner_tg_id INTEGER,
+            type TEXT,           -- 'PERSONAL' | 'BUSINESS' | 'BANK'
+            name TEXT,
+            balance REAL DEFAULT 0
+        )
+        """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS register_codes (
+            code TEXT UNIQUE
+        )
+        """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            txid TEXT,
+            from_acc TEXT,
+            to_acc TEXT,
+            amount REAL,
+            status TEXT
+        )
+        """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS admins (
+            tg_id INTEGER UNIQUE,
+            name TEXT
+        )
+        """)
+
+        # ensure main bank account exists
+        cursor = await db.execute("SELECT 1 FROM accounts WHERE account_id = 'ACC-001'")
+        if not await cursor.fetchone():
+            await db.execute(
+                "INSERT INTO accounts (account_id, owner_tg_id, type, name, balance) VALUES ('ACC-001', ?, 'BANK', 'Central Bank', 0)",
+                (owner_id,)
+            )
         await db.commit()
 
-async def is_bank_owner(tg_id: int, bank_owner_id: int) -> bool:
-    return tg_id == bank_owner_id
-
-async def is_admin(tg_id: int) -> bool:
+# -------------------- USERS --------------------
+async def create_user(tg_id, username, full_name, code):
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT 1 FROM admins WHERE tg_id = ?", (tg_id,)) as cur:
-            row = await cur.fetchone()
-            return row is not None
+        # consume a valid registration code
+        cursor = await db.execute("SELECT code FROM register_codes WHERE code = ?", (code,))
+        if not await cursor.fetchone():
+            return None, "Invalid registration code."
 
-# ----- Admin management (owner only) -----
-async def add_admin(tg_id: int, name: str):
+        # already registered?
+        cur_user = await db.execute("SELECT 1 FROM users WHERE tg_id = ?", (tg_id,))
+        if await cur_user.fetchone():
+            return None, "User already registered."
+
+        # consume code
+        await db.execute("DELETE FROM register_codes WHERE code = ?", (code,))
+
+        # unique personal account (avoid ACC-001)
+        account_id = await _generate_unique_account_id(db, "ACC-", 6, reserved={"ACC-001"})
+
+        await db.execute(
+            "INSERT INTO users (tg_id, username, full_name, personal_account) VALUES (?, ?, ?, ?)",
+            (tg_id, username, full_name, account_id)
+        )
+        await db.execute(
+            "INSERT INTO accounts (account_id, owner_tg_id, type, name, balance) VALUES (?, ?, 'PERSONAL', ?, 0)",
+            (account_id, tg_id, full_name)
+        )
+        await db.commit()
+    return account_id, None
+
+async def get_user_by_tgid(tg_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+async def get_user_by_account(account_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT owner_tg_id FROM accounts WHERE account_id = ?", (account_id,))
+        row = await cur.fetchone()
+        if not row:
+            return None
+        owner_tg = row["owner_tg_id"]
+        cur2 = await db.execute("SELECT * FROM users WHERE tg_id = ?", (owner_tg,))
+        u = await cur2.fetchone()
+        if not u:
+            return {"tg_id": owner_tg}
+        return {"tg_id": u["tg_id"], "username": u["username"], "full_name": u["full_name"], "account_id": u["personal_account"]}
+
+async def list_all_users():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("""
+        SELECT u.tg_id, u.username, u.full_name, a.account_id
+        FROM users u
+        JOIN accounts a ON a.owner_tg_id = u.tg_id AND a.type='PERSONAL'
+        ORDER BY u.full_name COLLATE NOCASE
+        """)
+        rows = await cur.fetchall()
+        return [{"tg_id": r["tg_id"], "username": r["username"], "full_name": r["full_name"], "account_id": r["account_id"]} for r in rows]
+
+# -------------------- ACCOUNTS --------------------
+async def list_user_accounts(tg_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT account_id, type, name, balance FROM accounts WHERE owner_tg_id = ?", (tg_id,))
+        rows = await cur.fetchall()
+        return [{"account_id": r["account_id"], "type": r["type"], "name": r["name"], "balance": r["balance"]} for r in rows]
+
+async def can_use_account(tg_id, account_id, must_be_type=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT type FROM accounts WHERE account_id = ? AND owner_tg_id = ?", (account_id, tg_id))
+        row = await cur.fetchone()
+        if not row:
+            return False
+        if must_be_type and row[0] != must_be_type:
+            return False
+        return True
+
+async def get_account_balance(account_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT balance FROM accounts WHERE account_id = ?", (account_id,))
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+async def adjust_account_balance(account_id, amount):
+    if amount == 0:
+        return False, "Amount must be non-zero."
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT balance FROM accounts WHERE account_id = ?", (account_id,))
+        row = await cur.fetchone()
+        if not row:
+            return False, "Account not found."
+        new_bal = row[0] + amount
+        if new_bal < 0:
+            return False, "Insufficient funds."
+        await db.execute("UPDATE accounts SET balance = ? WHERE account_id = ?", (new_bal, account_id))
+        await db.commit()
+    return True, None
+
+# -------------------- TRANSFERS --------------------
+async def transfer_funds(from_acc, to_acc, amount):
+    if amount is None or amount <= 0:
+        return False, "Amount must be > 0."
+    if from_acc == to_acc:
+        return False, "Cannot transfer to the same account."
+    async with aiosqlite.connect(DB_PATH) as db:
+        c1 = await db.execute("SELECT balance FROM accounts WHERE account_id = ?", (from_acc,))
+        fr = await c1.fetchone()
+        c2 = await db.execute("SELECT balance FROM accounts WHERE account_id = ?", (to_acc,))
+        to = await c2.fetchone()
+        if not fr or not to:
+            return False, "Account not found."
+        if fr[0] < amount:
+            return False, "Not enough balance."
+        await db.execute("UPDATE accounts SET balance = balance - ? WHERE account_id = ?", (amount, from_acc))
+        await db.execute("UPDATE accounts SET balance = balance + ? WHERE account_id = ?", (amount, to_acc))
+        await db.commit()
+    return True, "Completed"
+
+async def create_transaction(txid, from_acc, to_acc, amount, status):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO transactions (txid, from_acc, to_acc, amount, status) VALUES (?, ?, ?, ?, ?)",
+            (txid, from_acc, to_acc, amount, status)
+        )
+        await db.commit()
+
+# -------------------- BUSINESS --------------------
+async def create_business_account(owner_tg_id, name):
+    async with aiosqlite.connect(DB_PATH) as db:
+        acc_id = await _generate_unique_account_id(db, "BUS-", 5)
+        await db.execute(
+            "INSERT INTO accounts (account_id, owner_tg_id, type, name, balance) VALUES (?, ?, 'BUSINESS', ?, 0)",
+            (acc_id, owner_tg_id, name)
+        )
+        await db.commit()
+    return acc_id, None
+
+async def transfer_account_ownership(acc_id, new_owner):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT account_id FROM accounts WHERE account_id = ?", (acc_id,))
+        if not await cur.fetchone():
+            return False, "Account not found."
+        await db.execute("UPDATE accounts SET owner_tg_id = ? WHERE account_id = ?", (new_owner, acc_id))
+        await db.commit()
+    return True, None
+
+# -------------------- ADMIN --------------------
+async def add_register_code(code):
+    code = (code or "").strip()
+    if not code:
+        return False, "Code cannot be empty."
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute("INSERT INTO register_codes (code) VALUES (?)", (code,))
+            await db.commit()
+            return True, None
+        except Exception:
+            return False, "Code already exists."
+
+async def add_admin(tg_id, name):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR REPLACE INTO admins (tg_id, name) VALUES (?, ?)", (tg_id, name))
         await db.commit()
 
-async def remove_admin(tg_id: int):
+async def remove_admin(tg_id):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM admins WHERE tg_id = ?", (tg_id,))
         await db.commit()
 
-async def list_admins() -> List[Tuple[int, str]]:
+async def list_admins():
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT tg_id, name FROM admins ORDER BY name") as cur:
-            return await cur.fetchall()
+        cur = await db.execute("SELECT tg_id, name FROM admins")
+        rows = await cur.fetchall()
+        return [(r[0], r[1]) for r in rows]
 
-# ----- Registration codes -----
-async def add_register_code(code: str) -> Tuple[bool, str]:
+async def is_admin(tg_id):
     async with aiosqlite.connect(DB_PATH) as db:
-        try:
-            await db.execute("INSERT INTO register_codes (code, used) VALUES (?, 0)", (code,))
-            await db.commit()
-            return True, "OK"
-        except Exception as e:
-            return False, f"Cannot add code: {e}"
+        cur = await db.execute("SELECT tg_id FROM admins WHERE tg_id = ?", (tg_id,))
+        return bool(await cur.fetchone())
 
-async def _use_register_code(code: str) -> Tuple[bool, str]:
+async def is_bank_owner(tg_id, owner_id):
+    return int(tg_id) == int(owner_id)
+
+# -------------------- DELETE --------------------
+async def delete_account(account_id: str):
+    acc = account_id.upper()
+    if acc == "ACC-001":
+        return False, "Cannot delete the main bank account."
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT used FROM register_codes WHERE code = ?", (code,)) as cur:
-            row = await cur.fetchone()
-            if not row:
-                return False, "Invalid code"
-            if row[0] == 1:
-                return False, "Code already used"
-        await db.execute("UPDATE register_codes SET used = 1 WHERE code = ?", (code,))
+        cur = await db.execute("DELETE FROM accounts WHERE account_id = ?", (acc,))
         await db.commit()
-        return True, "OK"
+        if cur.rowcount == 0:
+            return False, "Account not found."
+    return True, None
 
-# ----- Users & Accounts -----
-async def create_user(tg_id: int, username: str, full_name: str, code: str) -> Tuple[str | None, str]:
-    ok, msg = await _use_register_code(code)
-    if not ok:
-        return None, msg
-
+async def delete_business_account(account_id: str):
     async with aiosqlite.connect(DB_PATH) as db:
-        # upsert user
-        await db.execute("""
-            INSERT INTO users (tg_id, username, full_name) VALUES (?, ?, ?)
-            ON CONFLICT(tg_id) DO UPDATE SET username=excluded.username, full_name=excluded.full_name
-        """, (tg_id, username, full_name))
-
-        # create personal account
-        while True:
-            acc = _gen_account_id()
-            async with db.execute("SELECT 1 FROM accounts WHERE account_id = ?", (acc,)) as cur:
-                if not await cur.fetchone():
-                    break
-
-        await db.execute("""
-            INSERT INTO accounts (account_id, owner_tg_id, balance, type, name)
-            VALUES (?, ?, 0, 'PERSONAL', NULL)
-        """, (acc, tg_id))
-
-        # access link
-        await db.execute("INSERT OR IGNORE INTO account_access (tg_id, account_id) VALUES (?, ?)", (tg_id, acc))
-
+        cur = await db.execute("DELETE FROM accounts WHERE account_id = ? AND type = 'BUSINESS'", (account_id.upper(),))
         await db.commit()
-        return acc, "OK"
-
-async def get_user_by_tgid(tg_id: int) -> Dict[str, Any] | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT tg_id, username, full_name FROM users WHERE tg_id = ?", (tg_id,)) as cur:
-            row = await cur.fetchone()
-            if not row:
-                return None
-            return {"tg_id": row[0], "username": row[1], "full_name": row[2]}
-
-async def get_user_by_account(account_id: str) -> Dict[str, Any] | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("""
-            SELECT u.tg_id, u.username, u.full_name
-            FROM accounts a JOIN users u ON a.owner_tg_id = u.tg_id
-            WHERE a.account_id = ?
-        """, (account_id,)) as cur:
-            row = await cur.fetchone()
-            if not row:
-                return None
-            return {"tg_id": row[0], "username": row[1], "full_name": row[2]}
-
-async def list_all_users() -> List[Dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("""
-            SELECT u.tg_id, u.username, u.full_name, a.account_id
-            FROM users u
-            JOIN accounts a ON a.owner_tg_id = u.tg_id AND a.type='PERSONAL'
-            ORDER BY u.full_name
-        """) as cur:
-            rows = await cur.fetchall()
-            return [{"tg_id": r[0], "username": r[1], "full_name": r[2], "account_id": r[3]} for r in rows]
-
-async def list_user_accounts(tg_id: int) -> List[Dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("""
-            SELECT a.account_id, a.type, a.name, a.balance
-            FROM account_access x
-            JOIN accounts a ON a.account_id = x.account_id
-            WHERE x.tg_id = ?
-            ORDER BY CASE a.type WHEN 'PERSONAL' THEN 0 WHEN 'BUSINESS' THEN 1 ELSE 2 END, a.account_id
-        """, (tg_id,)) as cur:
-            rows = await cur.fetchall()
-            return [{"account_id": r[0], "type": r[1], "name": r[2], "balance": r[3]} for r in rows]
-
-async def can_use_account(tg_id: int, account_id: str, must_be_type: str | None = None) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        # check access
-        async with db.execute("""
-            SELECT a.type
-            FROM account_access x JOIN accounts a ON a.account_id = x.account_id
-            WHERE x.tg_id = ? AND x.account_id = ?
-        """, (tg_id, account_id)) as cur:
-            row = await cur.fetchone()
-            if not row:
-                return False
-            if must_be_type and row[0] != must_be_type:
-                return False
-            return True
-
-async def create_business_account(requester_tg_id: int, chat_id: int, name: str) -> Tuple[str | None, str]:
-    # requester must be admin; checked at bot layer
-    async with aiosqlite.connect(DB_PATH) as db:
-        # ensure requester exists as user
-        await db.execute("INSERT OR IGNORE INTO users (tg_id, username, full_name) VALUES (?, ?, ?)", (requester_tg_id, None, None))
-
-        # create account
-        while True:
-            acc = _gen_account_id()
-            async with db.execute("SELECT 1 FROM accounts WHERE account_id = ?", (acc,)) as cur:
-                if not await cur.fetchone():
-                    break
-
-        await db.execute("""
-            INSERT INTO accounts (account_id, owner_tg_id, balance, type, name)
-            VALUES (?, ?, 0, 'BUSINESS', ?)
-        """, (acc, requester_tg_id, name))
-
-        # grant access to owner (requester)
-        await db.execute("INSERT OR IGNORE INTO account_access (tg_id, account_id) VALUES (?, ?)", (requester_tg_id, acc))
-        await db.commit()
-        return acc, "OK"
-
-async def transfer_account_ownership(account_id: str, new_owner_tg_id: int) -> Tuple[bool, str]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        # account must exist and be BUSINESS
-        async with db.execute("SELECT type FROM accounts WHERE account_id = ?", (account_id,)) as cur:
-            row = await cur.fetchone()
-            if not row:
-                return False, "Account not found"
-            if row[0] != "BUSINESS":
-                return False, "Only BUSINESS accounts can be transferred"
-
-        await db.execute("INSERT OR IGNORE INTO users (tg_id, username, full_name) VALUES (?, ?, ?)", (new_owner_tg_id, None, None))
-        await db.execute("UPDATE accounts SET owner_tg_id = ? WHERE account_id = ?", (new_owner_tg_id, account_id))
-        # move access
-        await db.execute("DELETE FROM account_access WHERE account_id = ?", (account_id,))
-        await db.execute("INSERT INTO account_access (tg_id, account_id) VALUES (?, ?)", (new_owner_tg_id, account_id))
-        await db.commit()
-        return True, "OK"
-
-# ----- Balances -----
-async def get_account_balance(account_id: str) -> float | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT balance FROM accounts WHERE account_id = ?", (account_id,)) as cur:
-            row = await cur.fetchone()
-            return float(row[0]) if row else None
-
-async def adjust_account_balance(account_id: str, delta: float) -> Tuple[bool, str]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT balance FROM accounts WHERE account_id = ?", (account_id,)) as cur:
-            row = await cur.fetchone()
-            if not row:
-                return False, "Account not found"
-            new_bal = float(row[0]) + float(delta)
-            if new_bal < 0:
-                return False, "Insufficient funds"
-        await db.execute("UPDATE accounts SET balance = ? WHERE account_id = ?", (new_bal, account_id))
-        await db.commit()
-        return True, "OK"
-
-# ----- Transfer & Transactions -----
-async def transfer_funds(from_account: str, to_account: str, amount: float) -> Tuple[bool, str]:
-    if amount <= 0:
-        return False, "Invalid amount"
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("BEGIN IMMEDIATE")
-        # fetch balances
-        async with db.execute("SELECT balance FROM accounts WHERE account_id = ?", (from_account,)) as cur:
-            row_from = await cur.fetchone()
-        async with db.execute("SELECT balance FROM accounts WHERE account_id = ?", (to_account,)) as cur:
-            row_to = await cur.fetchone()
-
-        if not row_from or not row_to:
-            await db.execute("ROLLBACK")
-            return False, "Account not found"
-
-        bal_from = float(row_from[0])
-        bal_to = float(row_to[0])
-
-        if bal_from < amount:
-            await db.execute("ROLLBACK")
-            return False, "Insufficient funds"
-
-        bal_from -= amount
-        bal_to += amount
-
-        await db.execute("UPDATE accounts SET balance = ? WHERE account_id = ?", (bal_from, from_account))
-        await db.execute("UPDATE accounts SET balance = ? WHERE account_id = ?", (bal_to, to_account))
-        await db.commit()
-        return True, "OK"
-
-async def create_transaction(txid: str, from_account: str, to_account: str, amount: float, status: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO transactions (txid, from_account, to_account, amount, status)
-            VALUES (?, ?, ?, ?, ?)
-        """, (txid, from_account, to_account, amount, status))
-        await db.commit()
+        if cur.rowcount == 0:
+            return False, "Business account not found."
+    return True, None
