@@ -6,7 +6,6 @@ import aiosqlite
 
 DB_PATH = os.environ.get("DB_PATH", "bank.db")
 
-# -------------------- Helpers --------------------
 async def _generate_unique_account_id(db: aiosqlite.Connection, prefix: str, digits: int, reserved: set[str] | None = None) -> str:
     reserved = reserved or set()
     while True:
@@ -18,7 +17,6 @@ async def _generate_unique_account_id(db: aiosqlite.Connection, prefix: str, dig
         if not await cur.fetchone():
             return acc_id
 
-# -------------------- INIT --------------------
 async def init_db(owner_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -28,23 +26,17 @@ async def init_db(owner_id: int):
             username TEXT,
             full_name TEXT,
             personal_account TEXT
-        )
-        """)
+        )""")
         await db.execute("""
         CREATE TABLE IF NOT EXISTS accounts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             account_id TEXT UNIQUE,
             owner_tg_id INTEGER,
-            type TEXT,           -- 'PERSONAL' | 'BUSINESS' | 'BANK'
+            type TEXT,
             name TEXT,
             balance REAL DEFAULT 0
-        )
-        """)
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS register_codes (
-            code TEXT UNIQUE
-        )
-        """)
+        )""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS register_codes (code TEXT UNIQUE)""")
         await db.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,51 +45,32 @@ async def init_db(owner_id: int):
             to_acc TEXT,
             amount REAL,
             status TEXT
-        )
-        """)
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS admins (
-            tg_id INTEGER UNIQUE,
-            name TEXT
-        )
-        """)
+        )""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS admins (tg_id INTEGER UNIQUE, name TEXT)""")
 
-        # ensure main bank account exists
-        cursor = await db.execute("SELECT 1 FROM accounts WHERE account_id = 'ACC-001'")
-        if not await cursor.fetchone():
+        cur = await db.execute("SELECT 1 FROM accounts WHERE account_id = 'ACC-001'")
+        if not await cur.fetchone():
             await db.execute(
                 "INSERT INTO accounts (account_id, owner_tg_id, type, name, balance) VALUES ('ACC-001', ?, 'BANK', 'Central Bank', 0)",
                 (owner_id,)
             )
         await db.commit()
 
-# -------------------- USERS --------------------
 async def create_user(tg_id, username, full_name, code):
     async with aiosqlite.connect(DB_PATH) as db:
-        # consume a valid registration code
-        cursor = await db.execute("SELECT code FROM register_codes WHERE code = ?", (code,))
-        if not await cursor.fetchone():
+        cur = await db.execute("SELECT code FROM register_codes WHERE code = ?", (code,))
+        if not await cur.fetchone():
             return None, "Invalid registration code."
-
-        # already registered?
-        cur_user = await db.execute("SELECT 1 FROM users WHERE tg_id = ?", (tg_id,))
-        if await cur_user.fetchone():
+        # prevents double-register
+        cur2 = await db.execute("SELECT 1 FROM users WHERE tg_id = ?", (tg_id,))
+        if await cur2.fetchone():
             return None, "User already registered."
-
-        # consume code
         await db.execute("DELETE FROM register_codes WHERE code = ?", (code,))
-
-        # unique personal account (avoid ACC-001)
         account_id = await _generate_unique_account_id(db, "ACC-", 6, reserved={"ACC-001"})
-
-        await db.execute(
-            "INSERT INTO users (tg_id, username, full_name, personal_account) VALUES (?, ?, ?, ?)",
-            (tg_id, username, full_name, account_id)
-        )
-        await db.execute(
-            "INSERT INTO accounts (account_id, owner_tg_id, type, name, balance) VALUES (?, ?, 'PERSONAL', ?, 0)",
-            (account_id, tg_id, full_name)
-        )
+        await db.execute("INSERT INTO users (tg_id, username, full_name, personal_account) VALUES (?, ?, ?, ?)",
+                         (tg_id, username, full_name, account_id))
+        await db.execute("INSERT INTO accounts (account_id, owner_tg_id, type, name, balance) VALUES (?, ?, 'PERSONAL', ?, 0)",
+                         (account_id, tg_id, full_name))
         await db.commit()
     return account_id, None
 
@@ -127,14 +100,12 @@ async def list_all_users():
         db.row_factory = aiosqlite.Row
         cur = await db.execute("""
         SELECT u.tg_id, u.username, u.full_name, a.account_id
-        FROM users u
-        JOIN accounts a ON a.owner_tg_id = u.tg_id AND a.type='PERSONAL'
+        FROM users u JOIN accounts a ON a.owner_tg_id = u.tg_id AND a.type='PERSONAL'
         ORDER BY u.full_name COLLATE NOCASE
         """)
         rows = await cur.fetchall()
         return [{"tg_id": r["tg_id"], "username": r["username"], "full_name": r["full_name"], "account_id": r["account_id"]} for r in rows]
 
-# -------------------- ACCOUNTS --------------------
 async def list_user_accounts(tg_id):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -173,7 +144,6 @@ async def adjust_account_balance(account_id, amount):
         await db.commit()
     return True, None
 
-# -------------------- TRANSFERS --------------------
 async def transfer_funds(from_acc, to_acc, amount):
     if amount is None or amount <= 0:
         return False, "Amount must be > 0."
@@ -201,7 +171,6 @@ async def create_transaction(txid, from_acc, to_acc, amount, status):
         )
         await db.commit()
 
-# -------------------- BUSINESS --------------------
 async def create_business_account(owner_tg_id, name):
     async with aiosqlite.connect(DB_PATH) as db:
         acc_id = await _generate_unique_account_id(db, "BUS-", 5)
@@ -221,7 +190,6 @@ async def transfer_account_ownership(acc_id, new_owner):
         await db.commit()
     return True, None
 
-# -------------------- ADMIN --------------------
 async def add_register_code(code):
     code = (code or "").strip()
     if not code:
@@ -258,7 +226,6 @@ async def is_admin(tg_id):
 async def is_bank_owner(tg_id, owner_id):
     return int(tg_id) == int(owner_id)
 
-# -------------------- DELETE --------------------
 async def delete_account(account_id: str):
     acc = account_id.upper()
     if acc == "ACC-001":
