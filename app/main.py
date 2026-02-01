@@ -1,4 +1,5 @@
 import asyncio
+import os
 from io import BytesIO
 
 import aiosqlite
@@ -39,29 +40,35 @@ from app.receipt.generator import generate_receipt
 CURRENCY_UNIT = "SOLEN"
 
 
+def _ensure_db_dir():
+    # If DB_PATH contains a directory (e.g. data/bot.db), create it.
+    db_path = getattr(settings, "DB_PATH", "data/eclis.db")
+    db_dir = os.path.dirname(db_path)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
+
 # ───────── UI (Inline Menu) ─────────
 
 def build_main_menu():
     kb = InlineKeyboardBuilder()
-    kb.button(text="💰 Balance", callback_data="menu:balance")
-    kb.button(text="👤 Accounts / Switch", callback_data="menu:accounts")
-    kb.button(text="📜 History (7d)", callback_data="menu:history")
-    kb.button(text="🔁 Transfer", callback_data="menu:transfer")
-    kb.button(text="🛡 Admin", callback_data="menu:admin")
+    kb.button(text="Balance", callback_data="menu:balance")
+    kb.button(text="Accounts / Switch", callback_data="menu:accounts")
+    kb.button(text="History (7d)", callback_data="menu:history")
+    kb.button(text="Transfer", callback_data="menu:transfer")
+    kb.button(text="Admin", callback_data="menu:admin")
     kb.adjust(2, 2, 1)
     return kb.as_markup()
 
 
-async def send_menu(message: Message):
-    await message.answer(
-        "ECLIS BANKING SYSTEM\n\nSelect an action:",
-        reply_markup=build_main_menu(),
-    )
+async def send_menu_to_message(msg: Message):
+    await msg.answer("ECLIS BANKING SYSTEM\n\nSelect an action:", reply_markup=build_main_menu())
 
 
 # ───────── Receipt regeneration (for payroll sending) ─────────
 
 async def _regen_receipt_png(receipt_no: str) -> bytes:
+    _ensure_db_dir()
     async with aiosqlite.connect(settings.DB_PATH) as db:
         cur = await db.execute(
             """
@@ -110,17 +117,47 @@ async def _regen_receipt_png(receipt_no: str) -> bytes:
     return bio.getvalue()
 
 
+# ───────── Helpers without mutating Message (fix frozen_instance) ─────────
+
+async def show_balance(user_id: int, reply_to: Message):
+    acc = await get_active_account(user_id)
+    if not acc:
+        await reply_to.answer("No active account. Create: /new_personal or /new_business")
+        return
+    bal = await get_balance(acc.id)
+    await reply_to.answer(f"Balance for {acc.label} ({acc.kind}) [ID:{acc.id}]: {bal:,} {CURRENCY_UNIT}")
+
+
+async def show_history(user_id: int, reply_to: Message):
+    acc = await get_active_account(user_id)
+    if not acc:
+        await reply_to.answer("No active account. Create: /new_personal or /new_business")
+        return
+    rows = await get_last_7_days(acc.id, limit=30)
+    if not rows:
+        await reply_to.answer("No transactions in last 7 days.")
+        return
+
+    lines = [f"Last 7 days history for {acc.label} ({acc.kind}) [ID:{acc.id}]:"]
+    for r in rows:
+        direction = "OUT" if r.from_account_id == acc.id else "IN"
+        other = r.to_account_id if direction == "OUT" else r.from_account_id
+        lines.append(f"{direction} | {r.amount:,} {CURRENCY_UNIT} | {r.status} | other:{other} | #{r.receipt_no}")
+    await reply_to.answer("\n".join(lines))
+
+
 # ───────── Core handlers ─────────
 
 async def start_handler(message: Message):
-    await send_menu(message)
+    await send_menu_to_message(message)
 
 
 async def menu_handler(message: Message):
-    await send_menu(message)
+    await send_menu_to_message(message)
 
 
 async def init_handler(message: Message):
+    _ensure_db_dir()
     await init_db()
     await ensure_payroll_schema()
     await message.answer("DB INIT OK")
@@ -133,7 +170,11 @@ async def set_owner_handler(message: Message):
     if len(parts) != 2 or not parts[1].isdigit():
         await message.answer("Usage: /set_owner <tg_id>")
         return
-    await ensure_owner_seed(int(parts[1]))
+    try:
+        await ensure_owner_seed(int(parts[1]))
+    except Exception as e:
+        await message.answer(f"Failed: {e}")
+        return
     await message.answer("OWNER set.")
 
 
@@ -339,6 +380,7 @@ async def staff_link_handler(message: Message):
     staff_id = int(parts[1])
     tg_id = int(parts[2])
 
+    _ensure_db_dir()
     async with aiosqlite.connect(settings.DB_PATH) as db:
         await db.execute("PRAGMA foreign_keys=ON;")
         await db.execute("UPDATE business_staff SET staff_tg_id = ? WHERE id = ?;", (tg_id, staff_id))
@@ -359,6 +401,7 @@ async def staff_unlink_handler(message: Message):
 
     staff_id = int(parts[1])
 
+    _ensure_db_dir()
     async with aiosqlite.connect(settings.DB_PATH) as db:
         await db.execute("PRAGMA foreign_keys=ON;")
         await db.execute("UPDATE business_staff SET staff_tg_id = NULL WHERE id = ?;", (staff_id,))
@@ -407,6 +450,7 @@ async def payroll_run_handler(message: Message):
         return
 
     # lookup staff tg ids
+    _ensure_db_dir()
     async with aiosqlite.connect(settings.DB_PATH) as db:
         cur = await db.execute(
             "SELECT id, staff_name, staff_tg_id FROM business_staff WHERE business_account_id = ?;",
@@ -422,10 +466,11 @@ async def payroll_run_handler(message: Message):
     total_paid = 0
 
     for staff_id, receipt_no in results:
-        name, tg_id = staff_map.get(int(staff_id), (f"staff#{staff_id}", None))
+        _name, tg_id = staff_map.get(int(staff_id), (f"staff#{staff_id}", None))
 
         try:
             png = await _regen_receipt_png(str(receipt_no))
+            _ensure_db_dir()
             async with aiosqlite.connect(settings.DB_PATH) as db:
                 cur = await db.execute("SELECT amount FROM transactions WHERE receipt_no = ? LIMIT 1;", (str(receipt_no),))
                 r = await cur.fetchone()
@@ -459,20 +504,14 @@ async def payroll_run_handler(message: Message):
         f"Receipts: {len(results)}\n"
         f"Sent to staff: {sent}\n"
         f"Not linked (no TG): {not_linked}\n"
-        f"Failed deliveries: {failed}\n\n"
-        "Tip: Link staff TG IDs using /staff_link <staff_id> <tg_id>"
+        f"Failed deliveries: {failed}"
     )
 
 
 # ───────── USER ─────────
 
 async def balance_handler(message: Message):
-    acc = await get_active_account(message.from_user.id)
-    if not acc:
-        await message.answer("No active account.")
-        return
-    bal = await get_balance(acc.id)
-    await message.answer(f"Balance: {bal:,} {CURRENCY_UNIT}")
+    await show_balance(message.from_user.id, message)
 
 
 async def transfer_handler(message: Message):
@@ -508,14 +547,14 @@ async def transfer_handler(message: Message):
 
     filename = f"receipt_{receipt_no}.png"
 
-    # sender
     await message.answer_photo(
         BufferedInputFile(png, filename=filename),
         caption=f"Transfer OK\nReceipt: {receipt_no}",
     )
 
-    # receiver (best-effort): send to owner_tg_id of receiver account
+    # receiver (best-effort)
     try:
+        _ensure_db_dir()
         async with aiosqlite.connect(settings.DB_PATH) as db:
             cur = await db.execute(
                 "SELECT owner_tg_id FROM accounts WHERE id = ? AND is_active = 1 LIMIT 1;",
@@ -525,54 +564,34 @@ async def transfer_handler(message: Message):
 
         if row:
             receiver_owner_tg_id = int(row[0])
-            if receiver_owner_tg_id != message.from_user.id and receiver_owner_tg_id != 0:
+            if receiver_owner_tg_id not in (message.from_user.id, 0):
                 await message.bot.send_photo(
                     chat_id=receiver_owner_tg_id,
                     photo=BufferedInputFile(png, filename=filename),
                     caption=f"You received a transfer.\nReceipt: {receipt_no}",
                 )
     except Exception:
-        await message.answer("Note: Could not deliver receipt to receiver (they may not have started the bot).")
+        await message.answer("Note: Could not deliver receipt to receiver.")
 
 
 async def history_handler(message: Message):
-    acc = await get_active_account(message.from_user.id)
-    if not acc:
-        await message.answer("No active account.")
-        return
-
-    rows = await get_last_7_days(acc.id, limit=30)
-    if not rows:
-        await message.answer("No transactions in last 7 days.")
-        return
-
-    lines = [f"Last 7 days history for {acc.label} ({acc.kind}) [ID:{acc.id}]:"]
-    for r in rows:
-        direction = "OUT" if r.from_account_id == acc.id else "IN"
-        other = r.to_account_id if direction == "OUT" else r.from_account_id
-        lines.append(f"{direction} | {r.amount:,} {CURRENCY_UNIT} | {r.status} | other:{other} | #{r.receipt_no}")
-
-    await message.answer("\n".join(lines))
+    await show_history(message.from_user.id, message)
 
 
 # ───────── Callback handlers (Menu) ─────────
 
 async def on_menu_callback(call: CallbackQuery):
-    data = call.data or ""
     await call.answer()
+    user_id = call.from_user.id
+    msg = call.message
 
-    if data == "menu:balance":
-        # emulate /balance
-        fake = Message.model_validate(call.message.model_dump())
-        fake.from_user = call.from_user
-        fake.chat = call.message.chat
-        await balance_handler(fake)
+    if call.data == "menu:balance":
+        await show_balance(user_id, msg)
 
-    elif data == "menu:accounts":
-        tg_id = call.from_user.id
-        active_id, accounts = await list_accounts(tg_id)
+    elif call.data == "menu:accounts":
+        active_id, accounts = await list_accounts(user_id)
         if not accounts:
-            await call.message.answer("No accounts. Create: /new_personal or /new_business")
+            await msg.answer("No accounts. Create: /new_personal or /new_business")
             return
 
         kb = InlineKeyboardBuilder()
@@ -583,23 +602,20 @@ async def on_menu_callback(call: CallbackQuery):
                 callback_data=f"switch:{acc.id}",
             )
         kb.adjust(1)
-        await call.message.answer("Select active account:", reply_markup=kb.as_markup())
+        await msg.answer("Select active account:", reply_markup=kb.as_markup())
 
-    elif data == "menu:history":
-        fake = Message.model_validate(call.message.model_dump())
-        fake.from_user = call.from_user
-        fake.chat = call.message.chat
-        await history_handler(fake)
+    elif call.data == "menu:history":
+        await show_history(user_id, msg)
 
-    elif data == "menu:transfer":
-        await call.message.answer("Use:\n/transfer <to_account_id> <amount> <description>")
+    elif call.data == "menu:transfer":
+        await msg.answer("Use:\n/transfer <to_account_id> <amount> <description>")
 
-    elif data == "menu:admin":
-        if not await is_admin(call.from_user.id):
-            await call.message.answer("Admin only.")
+    elif call.data == "menu:admin":
+        if not await is_admin(user_id):
+            await msg.answer("Admin only.")
             return
-        await call.message.answer(
-            "Admin commands:\n"
+        await msg.answer(
+            "Admin:\n"
             "/pool_balance\n"
             "/pool_give <to_account_id> <amount> <desc>\n"
             "/force <from_account_id> <to_account_id> <amount> <desc>\n"
@@ -641,17 +657,17 @@ async def on_switch_callback(call: CallbackQuery):
 
 
 async def main():
+    _ensure_db_dir()
+
     bot = Bot(token=settings.BOT_TOKEN)
     dp = Dispatcher()
 
     dp.include_router(accounts_router)
 
-    # base
     dp.message.register(start_handler, F.text == "/start")
     dp.message.register(menu_handler, F.text == "/menu")
     dp.message.register(init_handler, F.text == "/init")
 
-    # owner/admin
     dp.message.register(set_owner_handler, F.text.startswith("/set_owner"))
     dp.message.register(admin_add_handler, F.text.startswith("/admin_add"))
     dp.message.register(admin_remove_handler, F.text.startswith("/admin_remove"))
@@ -660,7 +676,6 @@ async def main():
     dp.message.register(pool_give_handler, F.text.startswith("/pool_give"))
     dp.message.register(force_transfer_handler, F.text.startswith("/force"))
 
-    # payroll
     dp.message.register(biz_register_handler, F.text.startswith("/biz_register"))
     dp.message.register(staff_add_handler, F.text.startswith("/staff_add"))
     dp.message.register(staff_list_handler, F.text.startswith("/staff_list"))
@@ -668,12 +683,10 @@ async def main():
     dp.message.register(staff_unlink_handler, F.text.startswith("/staff_unlink"))
     dp.message.register(payroll_run_handler, F.text.startswith("/payroll"))
 
-    # user
     dp.message.register(balance_handler, F.text == "/balance")
     dp.message.register(transfer_handler, F.text.startswith("/transfer"))
     dp.message.register(history_handler, F.text == "/history")
 
-    # callbacks
     dp.callback_query.register(on_menu_callback, F.data.startswith("menu:"))
     dp.callback_query.register(on_switch_callback, F.data.startswith("switch:"))
 
