@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional, Tuple
+from typing import Optional
 
 import aiosqlite
 
@@ -13,18 +12,13 @@ from app.db import create_account, get_or_create_owner
 SYSTEM_POOL_OWNER_TG_ID = 0  # system owner (not a real telegram user)
 SYSTEM_POOL_KIND = "system"
 SYSTEM_POOL_LABEL = "MAIN POOL"
-SYSTEM_POOL_ALIAS = "__MAIN_POOL__"
 
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-async def ensure_owner_seed(owner_tg_id: int) -> None:
-    """
-    Stores OWNER tg_user_id in a small table.
-    You must set OWNER_TG_ID in .env later, but for now we seed by calling set_owner once.
-    """
+async def _ensure_meta_table() -> None:
     async with aiosqlite.connect(settings.DB_PATH) as db:
         await db.execute(
             """
@@ -33,30 +27,38 @@ async def ensure_owner_seed(owner_tg_id: int) -> None:
                 v TEXT NOT NULL
             );
             """
-        )
-        await db.execute(
-            "INSERT OR REPLACE INTO meta(k, v) VALUES('OWNER_TG_ID', ?);",
-            (str(owner_tg_id),),
         )
         await db.commit()
 
 
 async def get_owner_tg_id() -> Optional[int]:
+    await _ensure_meta_table()
     async with aiosqlite.connect(settings.DB_PATH) as db:
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS meta (
-                k TEXT PRIMARY KEY,
-                v TEXT NOT NULL
-            );
-            """
-        )
         cur = await db.execute("SELECT v FROM meta WHERE k='OWNER_TG_ID' LIMIT 1;")
         row = await cur.fetchone()
         if not row:
             return None
         v = str(row[0]).strip()
         return int(v) if v.isdigit() else None
+
+
+async def ensure_owner_seed(owner_tg_id: int) -> None:
+    """
+    FINALIZE SECURITY:
+    - Can ONLY be set once.
+    - If OWNER_TG_ID already exists, this function raises.
+    """
+    await _ensure_meta_table()
+    existing = await get_owner_tg_id()
+    if existing is not None:
+        raise PermissionError("OWNER already set and locked")
+
+    async with aiosqlite.connect(settings.DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO meta(k, v) VALUES('OWNER_TG_ID', ?);",
+            (str(owner_tg_id),),
+        )
+        await db.commit()
 
 
 async def is_owner(tg_user_id: int) -> bool:
@@ -107,7 +109,6 @@ async def ensure_main_pool_account() -> int:
     Creates (or returns) MAIN POOL as a system account.
     Returns account_id of the pool.
     """
-    # Ensure system owner exists
     await get_or_create_owner(SYSTEM_POOL_OWNER_TG_ID)
 
     async with aiosqlite.connect(settings.DB_PATH) as db:
@@ -126,7 +127,6 @@ async def ensure_main_pool_account() -> int:
         if row:
             return int(row[0])
 
-    # Create via db helper (it also sets active_account_id for owner; harmless for system owner)
     pool_id = await create_account(
         tg_user_id=SYSTEM_POOL_OWNER_TG_ID,
         kind=SYSTEM_POOL_KIND,
