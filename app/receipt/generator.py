@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 
 
 TEHRAN_TZ = ZoneInfo("Asia/Tehran")
+CURRENCY_UNIT = "SOLEN"
 
 
 def _make_numeric_receipt_no() -> str:
@@ -12,7 +13,7 @@ def _make_numeric_receipt_no() -> str:
     Later we will replace this with a DB-backed incremental counter.
     """
     ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    return str(ms)  # numeric, long, low collision risk
+    return str(ms)
 
 
 def generate_receipt(
@@ -26,9 +27,8 @@ def generate_receipt(
     """
     Generates a receipt image and returns (receipt_no, image)
     - receipt_no is numeric (string digits).
-    - If receipt_no is not provided, a numeric timestamp-based number is generated.
+    - Amount is rendered with currency unit (SOLEN).
     """
-
     receipt_no = receipt_no or _make_numeric_receipt_no()
     now = datetime.now(TEHRAN_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -45,7 +45,6 @@ def generate_receipt(
         text_font = ImageFont.load_default()
         small_font = ImageFont.load_default()
 
-    # Title
     draw.text(
         (width // 2, 30),
         "ECLIS BANKING SYSTEM",
@@ -62,7 +61,7 @@ def generate_receipt(
         ("Time (Tehran)", now),
         ("Sender Account", sender_account),
         ("Receiver Account", receiver_account),
-        ("Amount", f"{amount:,}"),
+        ("Amount", f"{amount:,} {CURRENCY_UNIT}"),
         ("Status", status),
     ]
 
@@ -77,7 +76,6 @@ def generate_receipt(
         y += 32
         draw.text((60, y), description, font=small_font, fill="#cbd5f5")
 
-    # Footer
     draw.line((40, height - 70, width - 40, height - 70), fill="#334155", width=2)
     draw.text(
         (width // 2, height - 40),
