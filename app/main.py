@@ -6,13 +6,15 @@ from aiogram.types import Message, BufferedInputFile
 
 from app.config import settings
 from app.receipt.generator import generate_receipt
+from app.handlers.accounts import router as accounts_router
 
 
 async def start_handler(message: Message):
     await message.answer(
         "ECLIS BANKING SYSTEM\n\n"
         "Bot is running.\n"
-        "Use /receipt to get a test receipt."
+        "Use /receipt to get a test receipt.\n"
+        "Use /init then /new_personal or /new_business then /accounts."
     )
 
 
@@ -46,6 +48,8 @@ async def receipt_handler(message: Message):
 async def main():
     bot = Bot(token=settings.BOT_TOKEN)
     dp = Dispatcher()
+
+    dp.include_router(accounts_router)
 
     dp.message.register(start_handler, F.text == "/start")
     dp.message.register(receipt_handler, F.text == "/receipt")
