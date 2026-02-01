@@ -1,6 +1,5 @@
 import asyncio
 from io import BytesIO
-from datetime import datetime, timezone, timedelta
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
@@ -8,77 +7,43 @@ from aiogram.types import Message, BufferedInputFile
 
 from app.config import settings
 from app.db import init_db, get_active_account
-from app.receipt.generator import generate_receipt
 from app.handlers.accounts import router as accounts_router
+from app.receipt.generator import generate_receipt
+from app.banking import (
+    transfer as banking_transfer,
+    get_last_7_days,
+    get_balance,
+)
 
-# NEW: banking core (ledger + balance check + 7d history)
-from app.banking import transfer as banking_transfer, get_last_7_days, get_balance
-
+from app.admin import (
+    ensure_owner_seed,
+    is_owner,
+    is_admin,
+    add_admin,
+    remove_admin,
+    get_main_pool_account_id,
+)
 
 CURRENCY_UNIT = "SOLEN"
-
-
-async def _get_account_brief(account_id: int):
-    """
-    Returns (owner_tg_id, label, kind) or None
-    """
-    async with aiosqlite.connect(settings.DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT owner_tg_id, label, kind FROM accounts WHERE id = ? AND is_active = 1 LIMIT 1;",
-            (account_id,),
-        )
-        row = await cur.fetchone()
-        if not row:
-            return None
-        return int(row[0]), str(row[1]), str(row[2])
-
-
-# NOTE: kept for backward compatibility, but no longer used after switching to banking.py
-async def _insert_transaction(
-    receipt_no: str,
-    from_account_id: int,
-    to_account_id: int,
-    amount: int,
-    status: str,
-    description: str,
-    created_by_tg_id: int,
-):
-    async with aiosqlite.connect(settings.DB_PATH) as db:
-        await db.execute(
-            """
-            INSERT INTO transactions (
-                receipt_no, ts_utc,
-                from_account_id, to_account_id,
-                amount, status, description,
-                created_by_tg_id, forced
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0);
-            """,
-            (
-                receipt_no,
-                datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                from_account_id,
-                to_account_id,
-                amount,
-                status,
-                description,
-                created_by_tg_id,
-            ),
-        )
-        await db.commit()
 
 
 async def start_handler(message: Message):
     await message.answer(
         "ECLIS BANKING SYSTEM\n\n"
-        "Commands:\n"
-        "/init  (one-time DB init)\n"
+        "User commands:\n"
+        "/init\n"
         "/new_personal | /new_business\n"
         "/accounts | /switch <account_id>\n"
         "/balance\n"
         "/transfer <to_account_id> <amount> <description>\n"
-        "/history\n"
-        "/receipt (test receipt generator)"
+        "/history\n\n"
+        "Admin commands:\n"
+        "/set_owner <tg_id>\n"
+        "/admin_add <tg_id>\n"
+        "/admin_remove <tg_id>\n"
+        "/pool_balance\n"
+        "/pool_give <to_account_id> <amount> <description>\n"
+        "/force <from_account_id> <to_account_id> <amount> <description>"
     )
 
 
@@ -87,10 +52,137 @@ async def init_handler(message: Message):
     await message.answer("DB INIT OK")
 
 
+# ───────── OWNER / ADMIN ─────────
+
+async def set_owner_handler(message: Message):
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Usage: /set_owner <tg_id>")
+        return
+
+    owner_id = int(parts[1])
+    await ensure_owner_seed(owner_id)
+    await message.answer(f"OWNER set to TG ID: {owner_id}")
+
+
+async def admin_add_handler(message: Message):
+    if not await is_owner(message.from_user.id):
+        await message.answer("Only OWNER can add admins.")
+        return
+
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Usage: /admin_add <tg_id>")
+        return
+
+    await add_admin(int(parts[1]))
+    await message.answer("Admin added.")
+
+
+async def admin_remove_handler(message: Message):
+    if not await is_owner(message.from_user.id):
+        await message.answer("Only OWNER can remove admins.")
+        return
+
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Usage: /admin_remove <tg_id>")
+        return
+
+    await remove_admin(int(parts[1]))
+    await message.answer("Admin removed.")
+
+
+# ───────── POOL ─────────
+
+async def pool_balance_handler(message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.answer("Admin only.")
+        return
+
+    pool_id = await get_main_pool_account_id()
+    bal = await get_balance(pool_id)
+    await message.answer(f"MAIN POOL balance: {bal:,} {CURRENCY_UNIT}")
+
+
+async def pool_give_handler(message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.answer("Admin only.")
+        return
+
+    parts = message.text.split(maxsplit=3)
+    if len(parts) < 4:
+        await message.answer("Usage: /pool_give <to_account_id> <amount> <desc>")
+        return
+
+    _, to_id_raw, amount_raw, desc = parts
+    if not to_id_raw.isdigit() or not amount_raw.isdigit():
+        await message.answer("Account ID and amount must be numeric.")
+        return
+
+    pool_id = await get_main_pool_account_id()
+
+    try:
+        receipt_no, png = await banking_transfer(
+            from_account_id=pool_id,
+            to_account_id=int(to_id_raw),
+            amount=int(amount_raw),
+            description=desc,
+            created_by_tg_id=message.from_user.id,
+            forced=True,
+        )
+    except Exception as e:
+        await message.answer(f"Failed: {e}")
+        return
+
+    await message.answer_photo(
+        BufferedInputFile(png, filename=f"receipt_{receipt_no}.png"),
+        caption=f"POOL TRANSFER OK\nReceipt: {receipt_no}",
+    )
+
+
+async def force_transfer_handler(message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.answer("Admin only.")
+        return
+
+    parts = message.text.split(maxsplit=4)
+    if len(parts) < 5:
+        await message.answer(
+            "Usage:\n/force <from_account_id> <to_account_id> <amount> <desc>"
+        )
+        return
+
+    _, from_raw, to_raw, amount_raw, desc = parts
+    if not (from_raw.isdigit() and to_raw.isdigit() and amount_raw.isdigit()):
+        await message.answer("IDs and amount must be numeric.")
+        return
+
+    try:
+        receipt_no, png = await banking_transfer(
+            from_account_id=int(from_raw),
+            to_account_id=int(to_raw),
+            amount=int(amount_raw),
+            description=desc,
+            created_by_tg_id=message.from_user.id,
+            forced=True,
+        )
+    except Exception as e:
+        await message.answer(f"Force transfer failed: {e}")
+        return
+
+    await message.answer_photo(
+        BufferedInputFile(png, filename=f"receipt_{receipt_no}.png"),
+        caption=f"FORCED TRANSFER OK\nReceipt: {receipt_no}",
+    )
+
+
+# ───────── USER ─────────
+
 async def balance_handler(message: Message):
     acc = await get_active_account(message.from_user.id)
     if not acc:
-        await message.answer("No active account. Create/switch account first.")
+        await message.answer("No active account.")
         return
 
     bal = await get_balance(acc.id)
@@ -99,73 +191,28 @@ async def balance_handler(message: Message):
     )
 
 
-async def receipt_test_handler(message: Message):
-    # test receipt generator only
-    receipt_no, image = generate_receipt(
-        sender_account="TEST-SENDER",
-        receiver_account="TEST-RECEIVER",
-        amount=123456,
-        status="SUCCESS",
-        description="Test receipt only",
-    )
-    bio = BytesIO()
-    bio.name = f"receipt_{receipt_no}.png"
-    image.save(bio, format="PNG")
-    bio.seek(0)
-    await message.answer_photo(
-        BufferedInputFile(bio.read(), filename=bio.name),
-        caption=f"Receipt No: {receipt_no}",
-    )
-
-
 async def transfer_handler(message: Message):
-    """
-    Usage:
-      /transfer <to_account_id> <amount> <description...>
-    Sends receipt to sender and receiver (best-effort).
-    Uses banking core: ledger + prevents negative balance.
-    """
     parts = message.text.split(maxsplit=3)
     if len(parts) < 4:
-        await message.answer("Usage: /transfer <to_account_id> <amount> <description>")
+        await message.answer("Usage: /transfer <to_account_id> <amount> <desc>")
         return
 
-    _, to_acc_raw, amount_raw, description = parts
-
-    if not to_acc_raw.isdigit() or not amount_raw.isdigit():
-        await message.answer("to_account_id and amount must be numeric.")
-        return
-
-    to_account_id = int(to_acc_raw)
-    amount = int(amount_raw)
-
-    if amount <= 0:
-        await message.answer("Amount must be greater than zero.")
-        return
-
-    description = description.strip()
-    if not description:
-        await message.answer("Description is required.")
+    _, to_raw, amount_raw, desc = parts
+    if not to_raw.isdigit() or not amount_raw.isdigit():
+        await message.answer("Account ID and amount must be numeric.")
         return
 
     sender = await get_active_account(message.from_user.id)
     if not sender:
-        await message.answer("No active account. Create/switch account first.")
+        await message.answer("No active account.")
         return
-
-    receiver_info = await _get_account_brief(to_account_id)
-    if not receiver_info:
-        await message.answer("Receiver account not found.")
-        return
-
-    receiver_owner_tg_id, receiver_label, receiver_kind = receiver_info
 
     try:
-        receipt_no, png_bytes = await banking_transfer(
+        receipt_no, png = await banking_transfer(
             from_account_id=sender.id,
-            to_account_id=to_account_id,
-            amount=amount,
-            description=description,
+            to_account_id=int(to_raw),
+            amount=int(amount_raw),
+            description=desc,
             created_by_tg_id=message.from_user.id,
             forced=False,
         )
@@ -173,71 +220,51 @@ async def transfer_handler(message: Message):
         await message.answer(f"Transfer failed: {e}")
         return
 
-    filename = f"receipt_{receipt_no}.png"
-
-    # Send to sender
     await message.answer_photo(
-        BufferedInputFile(png_bytes, filename=filename),
-        caption=f"Transfer completed.\nReceipt No: {receipt_no}",
+        BufferedInputFile(png, filename=f"receipt_{receipt_no}.png"),
+        caption=f"Transfer OK\nReceipt: {receipt_no}",
     )
-
-    # Send to receiver (best-effort)
-    if receiver_owner_tg_id != message.from_user.id:
-        try:
-            await message.bot.send_photo(
-                chat_id=receiver_owner_tg_id,
-                photo=BufferedInputFile(png_bytes, filename=filename),
-                caption=f"You received a transfer.\nReceipt No: {receipt_no}",
-            )
-        except Exception:
-            await message.answer("Note: Could not deliver receipt to receiver (they may not have started the bot).")
 
 
 async def history_handler(message: Message):
-    """
-    Shows last 7 days transactions for the user's active account.
-    Uses banking core (ledger).
-    """
     acc = await get_active_account(message.from_user.id)
     if not acc:
-        await message.answer("No active account. Create/switch account first.")
+        await message.answer("No active account.")
         return
 
-    rows = await get_last_7_days(acc.id, limit=30)
+    rows = await get_last_7_days(acc.id)
     if not rows:
         await message.answer("No transactions in last 7 days.")
         return
 
-    lines = [f"Last 7 days history for: {acc.label} ({acc.kind}) [ID:{acc.id}]\n"]
+    lines = [f"History for {acc.label} ({acc.kind})\n"]
     for r in rows:
         direction = "OUT" if r.from_account_id == acc.id else "IN"
-        other = r.to_account_id if direction == "OUT" else r.from_account_id
         lines.append(
-            f"{direction} | {r.amount:,} {CURRENCY_UNIT} | {r.status} | other:{other} | {r.ts_utc} | #{r.receipt_no}\n"
-            f"desc: {r.description}"
+            f"{direction} | {r.amount:,} {CURRENCY_UNIT} | {r.status} | #{r.receipt_no}"
         )
 
-    await message.answer("\n\n".join(lines))
+    await message.answer("\n".join(lines))
 
 
 async def main():
     bot = Bot(token=settings.BOT_TOKEN)
     dp = Dispatcher()
 
-    # Routers
     dp.include_router(accounts_router)
 
-    # Core commands
     dp.message.register(start_handler, F.text == "/start")
     dp.message.register(init_handler, F.text == "/init")
 
-    # Added (balance)
+    dp.message.register(set_owner_handler, F.text.startswith("/set_owner"))
+    dp.message.register(admin_add_handler, F.text.startswith("/admin_add"))
+    dp.message.register(admin_remove_handler, F.text.startswith("/admin_remove"))
+
+    dp.message.register(pool_balance_handler, F.text == "/pool_balance")
+    dp.message.register(pool_give_handler, F.text.startswith("/pool_give"))
+    dp.message.register(force_transfer_handler, F.text.startswith("/force"))
+
     dp.message.register(balance_handler, F.text == "/balance")
-
-    # Kept (receipt test)
-    dp.message.register(receipt_test_handler, F.text == "/receipt")
-
-    # Banking
     dp.message.register(transfer_handler, F.text.startswith("/transfer"))
     dp.message.register(history_handler, F.text == "/history")
 
