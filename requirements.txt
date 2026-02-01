@@ -1,0 +1,6 @@
+aiogram==3.6.0
+python-dotenv==1.0.1
+pydantic==2.7.4
+pydantic-settings==2.3.4
+aiosqlite==0.20.0
+Pillow==10.4.0
