@@ -11,6 +11,12 @@ from app.db import init_db, get_active_account
 from app.receipt.generator import generate_receipt
 from app.handlers.accounts import router as accounts_router
 
+# NEW: banking core (ledger + balance check + 7d history)
+from app.banking import transfer as banking_transfer, get_last_7_days, get_balance
+
+
+CURRENCY_UNIT = "SOLEN"
+
 
 async def _get_account_brief(account_id: int):
     """
@@ -27,6 +33,7 @@ async def _get_account_brief(account_id: int):
         return int(row[0]), str(row[1]), str(row[2])
 
 
+# NOTE: kept for backward compatibility, but no longer used after switching to banking.py
 async def _insert_transaction(
     receipt_no: str,
     from_account_id: int,
@@ -68,14 +75,28 @@ async def start_handler(message: Message):
         "/init  (one-time DB init)\n"
         "/new_personal | /new_business\n"
         "/accounts | /switch <account_id>\n"
+        "/balance\n"
         "/transfer <to_account_id> <amount> <description>\n"
-        "/history"
+        "/history\n"
+        "/receipt (test receipt generator)"
     )
 
 
 async def init_handler(message: Message):
     await init_db()
     await message.answer("DB INIT OK")
+
+
+async def balance_handler(message: Message):
+    acc = await get_active_account(message.from_user.id)
+    if not acc:
+        await message.answer("No active account. Create/switch account first.")
+        return
+
+    bal = await get_balance(acc.id)
+    await message.answer(
+        f"Balance for {acc.label} ({acc.kind}) [ID:{acc.id}]: {bal:,} {CURRENCY_UNIT}"
+    )
 
 
 async def receipt_test_handler(message: Message):
@@ -101,7 +122,8 @@ async def transfer_handler(message: Message):
     """
     Usage:
       /transfer <to_account_id> <amount> <description...>
-    Sends receipt to sender and receiver (if receiver has started bot).
+    Sends receipt to sender and receiver (best-effort).
+    Uses banking core: ledger + prevents negative balance.
     """
     parts = message.text.split(maxsplit=3)
     if len(parts) < 4:
@@ -138,36 +160,24 @@ async def transfer_handler(message: Message):
 
     receiver_owner_tg_id, receiver_label, receiver_kind = receiver_info
 
-    sender_display = f"{sender.label} ({sender.kind}) [ID:{sender.id}]"
-    receiver_display = f"{receiver_label} ({receiver_kind}) [ID:{to_account_id}]"
+    try:
+        receipt_no, png_bytes = await banking_transfer(
+            from_account_id=sender.id,
+            to_account_id=to_account_id,
+            amount=amount,
+            description=description,
+            created_by_tg_id=message.from_user.id,
+            forced=False,
+        )
+    except Exception as e:
+        await message.answer(f"Transfer failed: {e}")
+        return
 
-    receipt_no, image = generate_receipt(
-        sender_account=sender_display,
-        receiver_account=receiver_display,
-        amount=amount,
-        status="SUCCESS",
-        description=description,
-    )
-
-    await _insert_transaction(
-        receipt_no=receipt_no,
-        from_account_id=sender.id,
-        to_account_id=to_account_id,
-        amount=amount,
-        status="SUCCESS",
-        description=description,
-        created_by_tg_id=message.from_user.id,
-    )
-
-    # Prepare PNG once, reuse for both
-    bio = BytesIO()
-    bio.name = f"receipt_{receipt_no}.png"
-    image.save(bio, format="PNG")
-    png_bytes = bio.getvalue()
+    filename = f"receipt_{receipt_no}.png"
 
     # Send to sender
     await message.answer_photo(
-        BufferedInputFile(png_bytes, filename=bio.name),
+        BufferedInputFile(png_bytes, filename=filename),
         caption=f"Transfer completed.\nReceipt No: {receipt_no}",
     )
 
@@ -176,51 +186,35 @@ async def transfer_handler(message: Message):
         try:
             await message.bot.send_photo(
                 chat_id=receiver_owner_tg_id,
-                photo=BufferedInputFile(png_bytes, filename=bio.name),
+                photo=BufferedInputFile(png_bytes, filename=filename),
                 caption=f"You received a transfer.\nReceipt No: {receipt_no}",
             )
         except Exception:
-            # receiver might not have started bot / blocked bot / privacy limits
             await message.answer("Note: Could not deliver receipt to receiver (they may not have started the bot).")
 
 
 async def history_handler(message: Message):
     """
     Shows last 7 days transactions for the user's active account.
+    Uses banking core (ledger).
     """
     acc = await get_active_account(message.from_user.id)
     if not acc:
         await message.answer("No active account. Create/switch account first.")
         return
 
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat(timespec="seconds")
-
-    async with aiosqlite.connect(settings.DB_PATH) as db:
-        cur = await db.execute(
-            """
-            SELECT receipt_no, ts_utc, from_account_id, to_account_id, amount, status, COALESCE(description,'')
-            FROM transactions
-            WHERE (from_account_id = ? OR to_account_id = ?)
-              AND ts_utc >= ?
-            ORDER BY ts_utc DESC
-            LIMIT 30;
-            """,
-            (acc.id, acc.id, cutoff),
-        )
-        rows = await cur.fetchall()
-
+    rows = await get_last_7_days(acc.id, limit=30)
     if not rows:
         await message.answer("No transactions in last 7 days.")
         return
 
     lines = [f"Last 7 days history for: {acc.label} ({acc.kind}) [ID:{acc.id}]\n"]
     for r in rows:
-        receipt_no, ts_utc, from_id, to_id, amount, status, desc = r
-        direction = "OUT" if from_id == acc.id else "IN"
-        other = to_id if direction == "OUT" else from_id
+        direction = "OUT" if r.from_account_id == acc.id else "IN"
+        other = r.to_account_id if direction == "OUT" else r.from_account_id
         lines.append(
-            f"{direction} | {amount:,} | {status} | other:{other} | {ts_utc} | #{receipt_no}\n"
-            f"desc: {desc}"
+            f"{direction} | {r.amount:,} {CURRENCY_UNIT} | {r.status} | other:{other} | {r.ts_utc} | #{r.receipt_no}\n"
+            f"desc: {r.description}"
         )
 
     await message.answer("\n\n".join(lines))
@@ -236,6 +230,11 @@ async def main():
     # Core commands
     dp.message.register(start_handler, F.text == "/start")
     dp.message.register(init_handler, F.text == "/init")
+
+    # Added (balance)
+    dp.message.register(balance_handler, F.text == "/balance")
+
+    # Kept (receipt test)
     dp.message.register(receipt_test_handler, F.text == "/receipt")
 
     # Banking
